@@ -6,8 +6,13 @@
 //! `simulateTransaction` so the builder can attach the footprint, resource fee
 //! and auth entries before returning unsigned XDR to the wallet.
 //!
+//! It also exposes `sendTransaction` and `getTransaction` so the submission
+//! service (issue #48) can submit signed XDR and poll the lifecycle of a
+//! transaction until it is finalised.
+//!
 //! See issue #47: "Transaction Builder Service: Unsigned Soroban XDR for
-//! Wallet Signing".
+//! Wallet Signing" and issue #48: "Transaction Submission and Lifecycle
+//! Tracking Service".
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -75,6 +80,59 @@ pub enum SimulationOutcome {
     Success(SimulationResult),
     /// Simulation failed; the builder maps this to HTTP 422.
     Error(ContractError),
+}
+
+/// Status returned by `sendTransaction`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum SendStatus {
+    /// Accepted into the queue; final status must be polled.
+    Pending,
+    /// Already known to the network; treat as idempotent success of submission.
+    Duplicate,
+    /// Node is overloaded; the caller should retry with backoff.
+    TryAgainLater,
+    /// Rejected outright (e.g. malformed or invalid transaction).
+    Error,
+}
+
+/// Result of a `sendTransaction` call.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SendResult {
+    pub status: SendStatus,
+    /// Hash of the submitted transaction, when the node returns one.
+    #[serde(default)]
+    pub hash: Option<String>,
+    /// Latest ledger at submission time.
+    #[serde(default)]
+    pub latest_ledger: u32,
+    /// Error result XDR, when the node rejected the transaction.
+    #[serde(default)]
+    pub error_result_xdr: Option<String>,
+}
+
+/// Status returned by `getTransaction`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum GetStatus {
+    Success,
+    NotFound,
+    Failed,
+}
+
+/// Result of a `getTransaction` call.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GetResult {
+    pub status: GetStatus,
+    /// Ledger the transaction was included in, when finalised.
+    #[serde(default)]
+    pub ledger: Option<u32>,
+    /// Result XDR (success or failure), when finalised.
+    #[serde(default)]
+    pub result_xdr: Option<String>,
+    /// Latest ledger at query time; used to detect expiry.
+    #[serde(default)]
+    pub latest_ledger: u32,
 }
 
 /// Soroban RPC client.
@@ -167,6 +225,75 @@ impl SorobanRpc {
         }))
     }
 
+    /// Submit a signed transaction envelope. `PENDING` and `DUPLICATE` are
+    /// both treated as accepted submissions; the caller tracks the lifecycle
+    /// via [`SorobanRpc::get_transaction`].
+    pub async fn send_transaction(&self, transaction_xdr: &str) -> Result<SendResult, RpcError> {
+        let params = json!({ "transaction": transaction_xdr });
+        let result = self.call("sendTransaction", params).await?;
+
+        let status = match result.get("status").and_then(Value::as_str) {
+            Some("PENDING") => SendStatus::Pending,
+            Some("DUPLICATE") => SendStatus::Duplicate,
+            Some("TRY_AGAIN_LATER") => SendStatus::TryAgainLater,
+            Some("ERROR") => SendStatus::Error,
+            other => {
+                return Err(RpcError::Unexpected(format!(
+                    "unknown sendTransaction status: {other:?}"
+                )))
+            }
+        };
+
+        Ok(SendResult {
+            status,
+            hash: result
+                .get("hash")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            latest_ledger: result
+                .get("latestLedger")
+                .and_then(Value::as_u64)
+                .unwrap_or(0) as u32,
+            error_result_xdr: result
+                .get("errorResultXdr")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+        })
+    }
+
+    /// Poll the status of a previously submitted transaction by hash.
+    pub async fn get_transaction(&self, hash: &str) -> Result<GetResult, RpcError> {
+        let params = json!({ "hash": hash });
+        let result = self.call("getTransaction", params).await?;
+
+        let status = match result.get("status").and_then(Value::as_str) {
+            Some("SUCCESS") => GetStatus::Success,
+            Some("NOT_FOUND") => GetStatus::NotFound,
+            Some("FAILED") => GetStatus::Failed,
+            other => {
+                return Err(RpcError::Unexpected(format!(
+                    "unknown getTransaction status: {other:?}"
+                )))
+            }
+        };
+
+        Ok(GetResult {
+            status,
+            ledger: result
+                .get("ledger")
+                .and_then(Value::as_u64)
+                .map(|l| l as u32),
+            result_xdr: result
+                .get("resultXdr")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            latest_ledger: result
+                .get("latestLedger")
+                .and_then(Value::as_u64)
+                .unwrap_or(0) as u32,
+        })
+    }
+
     async fn call(&self, method: &str, params: Value) -> Result<Value, RpcError> {
         let body = json!({
             "jsonrpc": "2.0",
@@ -239,13 +366,13 @@ mod tests {
     fn decodes_contract_error_code() {
         let err = decode_contract_error("HostError: Error(Contract, #12)");
         assert_eq!(err.code, Some(12));
-        assert!(err.message.contains("#12"));
+        assert!(err.message.contains("contract error #12"));
     }
 
     #[test]
-    fn passes_through_non_contract_errors() {
-        let err = decode_contract_error("network timeout");
+    fn decodes_non_contract_error() {
+        let err = decode_contract_error("HostError: Error(WasmVm, MissingValue)");
         assert_eq!(err.code, None);
-        assert_eq!(err.message, "network timeout");
+        assert_eq!(err.message, "HostError: Error(WasmVm, MissingValue)");
     }
 }
