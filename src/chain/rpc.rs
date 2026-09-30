@@ -1,153 +1,106 @@
-//! Minimal Soroban RPC client used by the transaction builder service.
-//!
-//! This module intentionally exposes only the handful of RPC methods the
-//! builder needs: fetching an account (for the live sequence number), reading
-//! the latest ledger (for time bounds / `valid_until_ledger`) and running
-//! `simulateTransaction` so the builder can attach the footprint, resource fee
-//! and auth entries before returning unsigned XDR to the wallet.
-//!
-//! It also exposes `sendTransaction` and `getTransaction` so the submission
-//! service (issue #48) can submit signed XDR and poll the lifecycle of a
-//! transaction until it is finalised.
-//!
-//! See issue #47: "Transaction Builder Service: Unsigned Soroban XDR for
-//! Wallet Signing" and issue #48: "Transaction Submission and Lifecycle
-//! Tracking Service".
-
-use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
-use thiserror::Error;
-
-/// Errors surfaced by the Soroban RPC client.
-#[derive(Debug, Error)]
-pub enum RpcError {
-    #[error("rpc transport error: {0}")]
-    Transport(String),
-    #[error("rpc returned error {code}: {message}")]
-    Rpc { code: i64, message: String },
-    #[error("account {0} not found (unfunded or does not exist)")]
-    AccountNotFound(String),
-    #[error("unexpected rpc response: {0}")]
-    Unexpected(String),
-}
-
-/// Account state needed to build a transaction.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AccountInfo {
-    pub account_id: String,
-    /// Current sequence number as a decimal string (i64 range).
-    pub sequence: String,
-}
-
-impl AccountInfo {
-    /// Sequence number to embed in the transaction: the account's current
-    /// sequence incremented by one, as required by Stellar.
-    pub fn next_sequence(&self) -> Result<i64, RpcError> {
-        let current: i64 = self
-            .sequence
-            .parse()
-            .map_err(|_| RpcError::Unexpected(format!("invalid sequence: {}", self.sequence)))?;
-        Ok(current + 1)
-    }
-}
-
-/// Result of a `simulateTransaction` call.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SimulationResult {
-    /// Base64-encoded `SorobanTransactionData` (footprint + resource fees).
-    pub transaction_data: String,
-    /// Minimum resource fee, as a decimal string.
-    pub min_resource_fee: String,
-    /// Base64-encoded auth entries required by the invocation.
-    #[serde(default)]
-    pub auth: Vec<String>,
-    /// Latest ledger at simulation time; used to derive `valid_until_ledger`.
-    pub latest_ledger: u32,
-}
-
-/// A decoded contract error returned by a failed simulation.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ContractError {
-    /// Contract error code, when the failure originated from the contract.
-    pub code: Option<u32>,
-    /// Human-readable message suitable for surfacing to the UI.
-    pub message: String,
-}
-
-/// Outcome of a simulation: either the assembled resources or a decoded error.
-#[derive(Debug, Clone)]
-pub enum SimulationOutcome {
-    Success(SimulationResult),
-    /// Simulation failed; the builder maps this to HTTP 422.
-    Error(ContractError),
-}
-
-/// Status returned by `sendTransaction`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum SendStatus {
-    /// Accepted into the queue; final status must be polled.
-    Pending,
-    /// Already known to the network; treat as idempotent success of submission.
-    Duplicate,
-    /// Node is overloaded; the caller should retry with backoff.
-    TryAgainLater,
-    /// Rejected outright (e.g. malformed or invalid transaction).
-    Error,
-}
-
-/// Result of a `sendTransaction` call.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SendResult {
-    pub status: SendStatus,
-    /// Hash of the submitted transaction, when the node returns one.
-    #[serde(default)]
-    pub hash: Option<String>,
-    /// Latest ledger at submission time.
-    #[serde(default)]
-    pub latest_ledger: u32,
-    /// Error result XDR, when the node rejected the transaction.
-    #[serde(default)]
-    pub error_result_xdr: Option<String>,
-}
-
-/// Status returned by `getTransaction`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum GetStatus {
-    Success,
-    NotFound,
-    Failed,
-}
-
-/// Result of a `getTransaction` call.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GetResult {
-    pub status: GetStatus,
-    /// Ledger the transaction was included in, when finalised.
-    #[serde(default)]
-    pub ledger: Option<u32>,
-    /// Result XDR (success or failure), when finalised.
-    #[serde(default)]
-    pub result_xdr: Option<String>,
-    /// Latest ledger at query time; used to detect expiry.
-    #[serde(default)]
-    pub latest_ledger: u32,
-}
-
-/// Soroban RPC client.
-#[derive(Debug, Clone)]
-pub struct SorobanRpc {
-    endpoint: String,
-    http: reqwest::Client,
-}
-
-impl SorobanRpc {
+impl RpcClient {
+    /// Create a client for the given RPC endpoint URL.
     pub fn new(endpoint: impl Into<String>) -> Self {
         Self {
             endpoint: endpoint.into(),
             http: reqwest::Client::new(),
         }
+    }
+
+    /// Fetch the account's current sequence number live from the network.
+    pub async fn get_account(&self, account_id: &str) -> R
+    endpoint: String,
+    http: reqwest::Client,
+}
+
+impl RpcClient {
+    /// Create a client for the given RPC endpoint URL.
+    pub fn new(endpoint: impl Into<String>) -> Self {
+        Self {
+            endpoint: endpoint.into(),
+            http: reqwest::Client::new(),
+        }
+    }
+
+    /// Fetch the account's current sequence number live from the network.
+    pub async fn get_account(&self, account_id: &str) -> Result<AccountInfo, RpcError> {
+        let params = json!({ "accountId": account_id });
+        let result = self.call("getAccount", params).await?;
+
+        let sequence = result
+    pub fn new(endpoint: impl Into<String>) -> Self {
+        Self {
+            endpoint: endpoint.into(),
+            http: reqwest::Client::new(),
+        }
+    }
+
+    /// Read a batch of ledger entries at a fixed ledger sequence.
+    ///
+    /// `keys` is split into chunks of at most [`MAX_LEDGER_KEYS_PER_CALL`] so
+    /// the RPC's per-call limit is never exceeded. When `ledger_seq` is set the
+    /// request is pinned to that sequence, giving the reconciler a consistent
+    /// snapshot of on-chain state.
+    pub async fn get_ledger_entries(
+        &self,
+        keys: &[LedgerKey],
+        ledger_seq: Option<u32>,
+    ) -> Result<GetLedgerEntriesResponse, ChainError> {
+        let mut all_entries = Vec::with_capacity(keys.len());
+        let mut latest_ledger = None;
+
+        for chunk in keys.chunks(MAX_LEDGER_KEYS_PER_CALL) {
+            let key_strings: Vec<&str> = chunk.iter().map(|k| k.key.as_str()).collect();
+            let mut params = json!({ "keys": key_strings });
+            if let Some(seq) = ledger_seq {
+                params["ledgerSeq"] = json!(seq);
+            }
+
+            let body = json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "getLedgerEntries",
+                "params": params,
+            });
+
+            let response = self
+                .http
+                .post(&self.endpoint)
+                .json(&body)
+                .send()
+                .await
+                .map_err(|e| ChainError::Rpc(e.to_string()))?;
+
+            let status = response.status();
+            let value: Value = response
+                .json()
+                .await
+                .map_err(|e| ChainError::Rpc(e.to_string()))?;
+
+            if !status.is_success() {
+                return Err(ChainError::Rpc(format!(
+                    "getLedgerEntries failed with status {status}: {value}"
+                )));
+            }
+
+            if let Some(err) = value.get("error") {
+                return Err(ChainError::Rpc(err.to_string()));
+            }
+
+            let result = value.get("result").cloned().unwrap_or(Value::Null);
+            let parsed: GetLedgerEntriesResponse = serde_json::from_value(result)
+                .map_err(|e| ChainError::Rpc(e.to_string()))?;
+
+            if latest_ledger.is_none() {
+                latest_ledger = parsed.latest_ledger;
+            }
+            all_entries.extend(parsed.entries);
+        }
+
+        Ok(GetLedgerEntriesResponse {
+            entries: all_entries,
+            latest_ledger,
+        })
     }
 
     /// Fetch the account's current sequence number live from the network.

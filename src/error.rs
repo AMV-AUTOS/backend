@@ -16,6 +16,14 @@ use serde_json::json;
 pub struct AppError {
     pub status: StatusCode,
     pub message: String,
+    /// Stable, machine-readable error code (e.g. `"series_expired"`,
+    /// `"budget_exceeded"`). `None` for generic errors that predate the
+    /// simulation preflight; the preflight always sets it so integrators
+    /// can branch on the code instead of parsing the human message.
+    pub code: Option<String>,
+    /// Optional remediation hint explaining how to fix the failure before
+    /// re-submitting (e.g. "restore the archived ledger entry").
+    pub hint: Option<String>,
 }
 
 impl AppError {
@@ -23,6 +31,25 @@ impl AppError {
         Self {
             status,
             message: message.into(),
+            code: None,
+            hint: None,
+        }
+    }
+
+    /// Builds an error carrying a stable API error code and an optional
+    /// remediation hint, used by the transaction simulation preflight to
+    /// translate opaque host/contract errors into actionable responses.
+    pub fn coded(
+        status: StatusCode,
+        code: impl Into<String>,
+        message: impl Into<String>,
+        hint: Option<String>,
+    ) -> Self {
+        Self {
+            status,
+            message: message.into(),
+            code: Some(code.into()),
+            hint,
         }
     }
 }
@@ -30,7 +57,12 @@ impl AppError {
 impl From<StatusCode> for AppError {
     fn from(status: StatusCode) -> Self {
         let message = status.canonical_reason().unwrap_or("error").to_string();
-        Self { status, message }
+        Self {
+            status,
+            message,
+            code: None,
+            hint: None,
+        }
     }
 }
 
@@ -49,7 +81,14 @@ pub fn db_error(context: &str, e: sqlx::Error) -> AppError {
 
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
-        (self.status, Json(json!({ "error": self.message }))).into_response()
+        let mut body = json!({ "error": self.message });
+        if let Some(code) = self.code {
+            body["code"] = json!(code);
+        }
+        if let Some(hint) = self.hint {
+            body["hint"] = json!(hint);
+        }
+        (self.status, Json(body)).into_response()
     }
 }
 
@@ -127,5 +166,19 @@ mod tests {
     fn app_error_from_status_code_uses_the_canonical_reason() {
         let app_err: AppError = StatusCode::NOT_FOUND.into();
         assert_eq!(app_err.message, "Not Found");
+        assert!(app_err.code.is_none());
+        assert!(app_err.hint.is_none());
+    }
+
+    #[test]
+    fn coded_error_carries_code_and_hint() {
+        let app_err = AppError::coded(
+            StatusCode::BAD_REQUEST,
+            "series_expired",
+            "series has expired",
+            Some("choose an active series".to_string()),
+        );
+        assert_eq!(app_err.code.as_deref(), Some("series_expired"));
+        assert_eq!(app_err.hint.as_deref(), Some("choose an active series"));
     }
 }

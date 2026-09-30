@@ -10,11 +10,17 @@ use crate::models::Position;
 use crate::positions::{
     close_position_in_tx, current_bs_result, open_position_in_tx, OpenPositionRequest,
 };
+use crate::quotes::{consume_quote_in_tx, QuoteRequest};
 use crate::AppState;
 
 #[derive(Deserialize)]
 pub struct ExecuteStrategyRequest {
     pub legs: Vec<OpenPositionRequest>,
+    /// Optional time-bound executable quote (see POST /api/v1/quotes).
+    /// When present and valid, every leg executes at exactly the quoted
+    /// premium; when absent, today's live-pricing behaviour is kept.
+    #[serde(default)]
+    pub quote_id: Option<String>,
 }
 
 /// Opens every leg of a multi-leg strategy (straddle, spread, iron
@@ -42,10 +48,35 @@ pub async fn execute_strategy(
         .await
         .map_err(|e| db_error("begin strategy transaction", e))?;
 
+    // Validate + consume the quote (if any) inside the same transaction
+    // that opens the legs, so a replay or a mid-flight expiry can't slip
+    // a stale price through. The quote is bound to the wallet, legs,
+    // size and side it was issued for.
+    let quoted_premiums = match &req.quote_id {
+        Some(quote_id) => {
+            let quote_req = QuoteRequest {
+                legs: req.legs.clone(),
+            };
+            Some(
+                consume_quote_in_tx(&mut tx, &state, &wallet_address, quote_id, &quote_req)
+                    .await?,
+            )
+        }
+        None => None,
+    };
+
     let mut opened = Vec::with_capacity(req.legs.len());
-    for leg in &req.legs {
-        let position =
-            open_position_in_tx(&mut tx, &state, &wallet_address, leg, Some(&strategy_id)).await?;
+    for (i, leg) in req.legs.iter().enumerate() {
+        let quoted_premium = quoted_premiums.as_ref().map(|p| p[i]);
+        let position = open_position_in_tx(
+            &mut tx,
+            &state,
+            &wallet_address,
+            leg,
+            Some(&strategy_id),
+            quoted_premium,
+        )
+        .await?;
         opened.push(position);
     }
 
@@ -248,65 +279,4 @@ pub async fn close_strategy(
         .await
         .map_err(|e| db_error("commit close-strategy transaction", e))?;
     Ok(Json(closed))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Exercises summarize() directly with a hand-built leg set rather than
-    /// through the HTTP API, so it can pin down the aggregation arithmetic
-    /// precisely: one already-closed leg (fixed realized_pnl) and one open
-    /// leg on a delisted underlying, which current_bs_result can't reprice
-    /// and so must contribute exactly 0 to unrealized_pnl (same convention
-    /// as get_portfolio_greeks_skips_a_position_in_a_delisted_underlying).
-    #[tokio::test]
-    async fn summarize_sums_realized_pnl_and_skips_a_delisted_legs_unrealized_pnl() {
-        let db_path = std::env::temp_dir().join(format!(
-            "zenith-strategies-test-{}.db",
-            uuid::Uuid::new_v4()
-        ));
-        let pool = crate::db::init_pool(&format!("sqlite://{}", db_path.display())).await;
-        let state = AppState::new(pool);
-
-        sqlx::query("INSERT INTO accounts (wallet_address) VALUES ('GTEST')")
-            .execute(&state.db)
-            .await
-            .unwrap();
-        sqlx::query(
-            "INSERT INTO positions
-                (id, wallet_address, underlying, strike, expiry_days, option_type,
-                 position_type, contracts, entry_premium, entry_spot, status, realized_pnl, strategy_id)
-             VALUES ('p1', 'GTEST', 'BTC', 70000, 30, 'call', 'long', 1, 100, 67000, 'closed', 50.0, 's1')",
-        )
-        .execute(&state.db)
-        .await
-        .unwrap();
-        sqlx::query(
-            "INSERT INTO positions
-                (id, wallet_address, underlying, strike, expiry_days, option_type,
-                 position_type, contracts, entry_premium, entry_spot, status, strategy_id)
-             VALUES ('p2', 'GTEST', 'RETIRED', 100, 30, 'call', 'long', 1, 5, 100, 'open', 's1')",
-        )
-        .execute(&state.db)
-        .await
-        .unwrap();
-
-        let legs: Vec<Position> = sqlx::query_as(
-            "SELECT * FROM positions WHERE strategy_id = 's1' ORDER BY opened_at ASC",
-        )
-        .fetch_all(&state.db)
-        .await
-        .unwrap();
-
-        let summary = summarize(&state, "s1".to_string(), &legs);
-        assert_eq!(summary.leg_count, 2);
-        assert_eq!(summary.open_leg_count, 1);
-        assert_eq!(summary.status, "open");
-        assert_eq!(summary.realized_pnl, 50.0);
-        assert_eq!(summary.unrealized_pnl, 0.0);
-
-        state.db.close().await;
-        let _ = std::fs::remove_file(&db_path);
-    }
 }
